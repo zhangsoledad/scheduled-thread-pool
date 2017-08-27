@@ -6,9 +6,9 @@
 #![warn(missing_docs)]
 #![doc(html_root_url="https://docs.rs/scheduled-thread-pool/0.1.0")]
 
-extern crate antidote;
+extern crate parking_lot;
 
-use antidote::{Mutex, Condvar};
+use parking_lot::{Mutex, Condvar};
 use std::collections::BinaryHeap;
 use std::cmp::{PartialOrd, Ord, PartialEq, Eq, Ordering};
 use std::sync::Arc;
@@ -29,7 +29,7 @@ enum JobType {
     FixedDelay {
         f: Box<FnMut() + Send + 'static>,
         delay: Duration,
-    }
+    },
 }
 
 struct Job {
@@ -140,7 +140,10 @@ impl ScheduledThreadPool {
         let pool = ScheduledThreadPool { shared: Arc::new(shared) };
 
         for i in 0..num_threads {
-            Worker::start(thread_name.map(|n| n.replace("{}", &i.to_string())), pool.shared.clone());
+            Worker::start(
+                thread_name.map(|n| n.replace("{}", &i.to_string())),
+                pool.shared.clone(),
+            );
         }
 
         pool
@@ -148,14 +151,16 @@ impl ScheduledThreadPool {
 
     /// Executes a closure as soon as possible in the pool.
     pub fn execute<F>(&self, job: F)
-        where F: FnOnce() + Send + 'static
+    where
+        F: FnOnce() + Send + 'static,
     {
         self.execute_after(Duration::from_secs(0), job)
     }
 
     /// Executes a closure after a time delay in the pool.
     pub fn execute_after<F>(&self, delay: Duration, job: F)
-        where F: FnOnce() + Send + 'static
+    where
+        F: FnOnce() + Send + 'static,
     {
         let job = Job {
             type_: JobType::Once(Thunk::new(job)),
@@ -174,7 +179,8 @@ impl ScheduledThreadPool {
     ///
     /// If the closure panics, it will not be run again.
     pub fn execute_at_fixed_rate<F>(&self, initial_delay: Duration, rate: Duration, f: F)
-        where F: FnMut() + Send + 'static
+    where
+        F: FnMut() + Send + 'static,
     {
         let job = Job {
             type_: JobType::FixedRate {
@@ -197,7 +203,8 @@ impl ScheduledThreadPool {
     ///
     /// If the closure panics, it will not be run again.
     pub fn execute_with_fixed_delay<F>(&self, initial_delay: Duration, delay: Duration, f: F)
-        where F: FnMut() + Send + 'static
+    where
+        F: FnMut() + Send + 'static,
     {
         let job = Job {
             type_: JobType::FixedDelay {
@@ -216,16 +223,13 @@ struct Worker {
 
 impl Worker {
     fn start(name: Option<String>, shared: Arc<SharedPool>) {
-        let mut worker = Worker {
-            shared: shared,
-        };
+        let mut worker = Worker { shared: shared };
 
         let mut thread = thread::Builder::new();
         if let Some(name) = name {
             thread = thread.name(name);
         }
-        thread.spawn(move || worker.run())
-            .unwrap();
+        thread.spawn(move || worker.run()).unwrap();
     }
 
     fn run(&mut self) {
@@ -252,10 +256,14 @@ impl Worker {
                 Some(e) => Need::WaitTimeout(e.time - now),
             };
 
-            inner = match need {
-                Need::Wait => self.shared.cvar.wait(inner),
-                Need::WaitTimeout(t) => self.shared.cvar.wait_timeout(inner, t).0,
-            };
+            match need {
+                Need::Wait => {
+                    self.shared.cvar.wait(&mut inner);
+                }
+                Need::WaitTimeout(t) => {
+                    self.shared.cvar.wait_for(&mut inner, t);
+                }
+            }
         }
 
         Some(inner.queue.pop().unwrap())
@@ -322,9 +330,9 @@ mod test {
         for _ in 0..TEST_TASKS {
             let waiter = waiter.clone();
             pool.execute(move || -> () {
-                             waiter.wait();
-                             panic!();
-                         });
+                waiter.wait();
+                panic!();
+            });
         }
 
         // Ensure the pool still works.
@@ -334,9 +342,9 @@ mod test {
             let tx = tx.clone();
             let waiter = waiter.clone();
             pool.execute(move || {
-                             waiter.wait();
-                             tx.send(1usize).unwrap();
-                         });
+                waiter.wait();
+                tx.send(1usize).unwrap();
+            });
         }
 
         assert_eq!(rx.iter().take(TEST_TASKS).fold(0, |a, b| a + b), TEST_TASKS);
@@ -378,16 +386,18 @@ mod test {
 
         let mut pool2 = Some(pool.clone());
         let mut i = 0i32;
-        pool.execute_at_fixed_rate(Duration::from_millis(500),
-                                   Duration::from_millis(500),
-                                   move || {
-                                       i += 1;
-                                       tx.send(i).unwrap();
-                                       rx2.recv().unwrap();
-                                       if i == 2 {
-                                           drop(pool2.take().unwrap());
-                                       }
-                                   });
+        pool.execute_at_fixed_rate(
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+            move || {
+                i += 1;
+                tx.send(i).unwrap();
+                rx2.recv().unwrap();
+                if i == 2 {
+                    drop(pool2.take().unwrap());
+                }
+            },
+        );
         drop(pool);
 
         assert_eq!(Ok(1), rx.recv());
